@@ -828,6 +828,11 @@ async def scan_stocks(body:dict):
 # ── HTML Serve ────────────────────────────────────────
 
 # HTML Serve - bist_v6_fix 4 blok
+
+# HTML - bist_v6_fix 4 blok
+
+
+
 _HTML = """<!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -3334,95 +3339,1271 @@ setTimeout(function(){
 },500);
 </script>
 <script>
-// BIST v6 FIX - 17,18,19,20,21
+// BIST v6 BLOK 4 - signalPrice + PnL + canli fiyat
 
-// 17: Push permission duzeltme
-function requestPushPermission(){
-  if(!('Notification' in window)){toast('Bildirim desteklenmiyor. Telegram kullanin.');return;}
-  if(Notification.permission==='granted'){toast('Push izni zaten var!');return;}
-  if(Notification.permission==='denied'){toast('Ayarlar > Safari > Bildirimler bolumunden etkinlestirin.');return;}
-  Notification.requestPermission(function(p){
-    if(p==='granted'){
-      toast('Push izni verildi!');
-      var d=document.getElementById('bgDot');if(d)d.className='bg-dot on';
-    } else {
-      toast('Izin verilmedi. Telegram aktif kalir.');
+// 1. signalPrice kaydet - startScan'i override et
+// openPositions'a signalPrice ekle
+var _b4_origSS = startScan;
+startScan = function(){
+  // startScan'dan once openPositions proxy'sini kur
+  var _origCreate = Object.getOwnPropertyDescriptor(S,'openPositions');
+  _b4_origSS.apply(this,arguments);
+};
+
+// Tarama bittikten sonra tum pozisyonlara signalPrice ekle
+var _b4_origRSigs = renderSigs;
+renderSigs = function(){
+  // Sinyallerden openPositions'a signalPrice aktar
+  if(S.sigs && S.sigs.length && S.openPositions){
+    S.sigs.forEach(function(sig){
+      if(sig.type==='stop') return;
+      var key = sig.ticker+'_'+sig.tf;
+      var pos = S.openPositions[key];
+      if(pos && !pos.signalPrice && sig.res && sig.res.price){
+        pos.signalPrice = sig.res.price;
+        pos.signalTime = sig.time instanceof Date ? sig.time.toISOString() : sig.time;
+      }
+    });
+    // localStorage guncelle
+    try{ localStorage.setItem('bist_positions',JSON.stringify(S.openPositions)); }catch(e){}
+  }
+  _b4_origRSigs.apply(this,arguments);
+};
+
+// 2. Canli fiyat - pozisyon sekmesi acikken her 2 dakikada guncelle
+var _b4_priceTimer = null;
+
+function b4FetchPrices(){
+  if(!S.openPositions) return;
+  var tickers = [];
+  Object.keys(S.openPositions).forEach(function(key){
+    var t = key.split('_')[0];
+    if(tickers.indexOf(t)===-1) tickers.push(t);
+  });
+  // Watchlist'tekiler de
+  if(S.watchlist){
+    S.watchlist.forEach(function(t){
+      if(tickers.indexOf(t)===-1) tickers.push(t);
+    });
+  }
+  if(!tickers.length) return;
+
+  fetch(PROXY_URL+'/prices?symbols='+encodeURIComponent(tickers.join(',')))
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var changed = false;
+      Object.keys(data).forEach(function(ticker){
+        var q = data[ticker];
+        if(q && q.price > 0){
+          S.priceCache[ticker] = {
+            price: q.price,
+            pct: q.change_pct||0,
+            change: q.change||0,
+            ts: Date.now(),
+            real: true
+          };
+          changed = true;
+          // Stop kontrolu
+          b4CheckStop(ticker, q.price);
+        }
+      });
+      if(changed){
+        // Pozisyon sekmesi aciksa yenile
+        var posPage = document.getElementById('page-positions');
+        if(posPage && posPage.classList.contains('on')){
+          renderPositions();
+        }
+        // Watchlist sekmesi aciksa
+        var wlPage = document.getElementById('page-watchlist');
+        if(wlPage && wlPage.classList.contains('on')){
+          renderWatchlist();
+        }
+      }
+    }).catch(function(){});
+}
+
+function b4CheckStop(ticker, curPrice){
+  if(!S.openPositions) return;
+  Object.keys(S.openPositions).forEach(function(key){
+    if(key.split('_')[0] !== ticker) return;
+    var pos = S.openPositions[key];
+    if(!pos) return;
+
+    // En yuksegi guncelle
+    if(curPrice > pos.highest) pos.highest = curPrice;
+
+    // Chandelier stop hesapla
+    var atrMult = C.atrm || 8;
+    pos.stopPrice = pos.highest - pos.entry * 0.022 * atrMult;
+
+    // Stop tetiklendi mi?
+    if(curPrice <= pos.stopPrice){
+      var tf = key.split('_')[1];
+      var pnl = ((curPrice - pos.entry) / pos.entry * 100).toFixed(2);
+      var stopSig = {
+        id: Date.now()+Math.random(),
+        ticker: ticker,
+        name: pos.name || ticker,
+        indices: [],
+        type: 'stop',
+        time: new Date(),
+        tf: tf || 'D',
+        res: {
+          price: curPrice,
+          signalPrice: pos.signalPrice || pos.entry,
+          stopPrice: pos.stopPrice,
+          stopPnl: pnl,
+          entry: pos.entry,
+          acts: [],
+          isReal: true
+        }
+      };
+      S.sigs.unshift(stopSig);
+      if(S.sigs.length > 200) S.sigs.pop();
+
+      // Telegram bildir
+      if(TG && TG.token && TG.chat) sendTG(stopSig);
+
+      // Ses
+      if(C.snd) beep(false);
+
+      // Toast
+      toast(ticker+' STOP tetiklendi! PnL: '+pnl+'%');
+
+      // Pozisyonu kapat
+      // Kapali gecmise ekle
+      if(!S.closedPositions) S.closedPositions = [];
+      S.closedPositions.unshift({
+        ticker: ticker, tf: tf,
+        entry: pos.entry, exit: curPrice,
+        signalPrice: pos.signalPrice || pos.entry,
+        pnlPct: pnl,
+        entryTime: pos.entryTime,
+        exitTime: new Date().toISOString(),
+        reason: 'stop'
+      });
+      try{ localStorage.setItem('bist_closed', JSON.stringify(S.closedPositions)); }catch(e){}
+
+      delete S.openPositions[key];
+      try{ localStorage.setItem('bist_positions', JSON.stringify(S.openPositions)); }catch(e){}
+
+      renderSigs();
+      updateBadge();
     }
   });
 }
 
-// 18: btEngine sharpe/calmar duzeltme
-var _origBtEng=btEngine;
-btEngine=function(ohlcv,xu100Closes,cfg){
-  var r=_origBtEng(ohlcv,xu100Closes,cfg);
-  if(!r||!r.trades||r.trades.length<2)return r;
-  var ct=r.trades.filter(function(t){return !t.open;});
-  var rets=ct.map(function(t){return parseFloat(t.p);});
-  if(rets.length<2)return r;
-  var mean=rets.reduce(function(a,b){return a+b;},0)/rets.length;
-  var vr=rets.reduce(function(a,x){return a+(x-mean)*(x-mean);},0)/rets.length;
-  var std=Math.sqrt(vr);
-  var avgBars=ct.reduce(function(a,t){return a+(t.bars||5);},0)/ct.length;
-  var rf=0.40*(avgBars/252)*100;
-  r.sharpe=std>0?((mean-rf)/std).toFixed(2):'0';
-  var dr=rets.filter(function(x){return x<0;});
-  var ds=0;if(dr.length){var dv=dr.reduce(function(a,x){return a+x*x;},0)/dr.length;ds=Math.sqrt(dv);}
-  r.sortino=ds>0?((mean-rf)/ds).toFixed(2):'0';
-  var tot=parseFloat(r.ret);var yrs=Math.max(0.1,(ohlcv?ohlcv.length:504)/252);
-  var ann=(Math.pow(1+tot/100,1/yrs)-1)*100;
-  var mdd=parseFloat(r.maxdd)||1;
-  r.calmar=mdd>0?(ann/mdd).toFixed(2):'0';
-  return r;
-};
-
-// 19/20: signalPrice - renderSigs override ile goster
-var _origRenderSigs=renderSigs;
-renderSigs=function(){
-  _origRenderSigs.apply(this,arguments);
-  saveSigsToLS();
-};
-
-// 21: Sinyal kalicilik
-function saveSigsToLS(){
-  try{
-    var sv=S.sigs.slice(0,100).map(function(s){
-      return{id:s.id,ticker:s.ticker,name:s.name||s.ticker,indices:s.indices||[],type:s.type||'buy',tf:s.tf||'D',
-        time:s.time instanceof Date?s.time.toISOString():s.time,
-        res:{price:s.res.price,signalPrice:s.res.signalPrice||s.res.price,cons:s.res.cons,adx:s.res.adx,
-          score:s.res.score,fp:s.res.fp,pstate:s.res.pstate,acts:s.res.acts||[],
-          currentStop:s.res.currentStop,isMaster:s.res.isMaster,strength:s.res.strength}};
+// 3. renderPositions override - signalPrice + gercek PnL
+var _b4_origRP = renderPositions;
+renderPositions = function(){
+  // Once signalPrice ekle
+  if(S.openPositions){
+    Object.keys(S.openPositions).forEach(function(key){
+      var pos = S.openPositions[key];
+      if(!pos) return;
+      if(!pos.signalPrice) pos.signalPrice = pos.entry;
+      // priceCache'den gercek fiyati al
+      var ticker = key.split('_')[0];
+      var cached = S.priceCache[ticker];
+      if(cached && cached.price > 0){
+        pos._curPrice = cached.price;
+        pos._pnlPct = ((cached.price - pos.entry) / pos.entry * 100);
+        pos._dayChg = cached.pct || 0;
+        // En yuksegi guncelle
+        if(cached.price > pos.highest) pos.highest = cached.price;
+      } else {
+        // Cache yoksa entry fiyati goster - PnL 0 degil bos goster
+        pos._curPrice = null;
+        pos._pnlPct = null;
+        pos._dayChg = null;
+      }
     });
-    localStorage.setItem('bist_sigs',JSON.stringify(sv));
+  }
+  _b4_origRP.apply(this,arguments);
+};
+
+// 4. buildMsg - sinyal + anlik fiyat
+buildMsg = function(sig){
+  var r = sig.res || {};
+  var tfL = sig.tf==='D'?'Gunluk':sig.tf==='240'?'4 Saat':'2 Saat';
+  var tvInt = sig.tf==='D'?'1D':sig.tf==='240'?'4H':'2H';
+  var chartUrl = 'https://www.tradingview.com/chart/?symbol=BIST:'+sig.ticker+'&interval='+tvInt;
+  var now = new Date();
+  var ts = pad(now.getHours())+':'+pad(now.getMinutes());
+  var sigPrice = r.signalPrice || r.price || '-';
+  var curPrice = r.price || '-';
+  var msg = '';
+
+  if(sig.type==='stop'){
+    var pnl = parseFloat(r.stopPnl||0);
+    msg = 'STOP TETIKLENDI\n--------------------\n'
+        + 'Hisse: '+sig.ticker+' - '+sig.name+'\n'
+        + 'TF: '+tfL+' | '+ts+'\n\n'
+        + 'Sinyal Fiyati: TL'+sigPrice+'\n'
+        + 'Anlik Fiyat: TL'+curPrice+'\n'
+        + 'Stop Seviyesi: TL'+(r.stopPrice||'-')+'\n'
+        + 'Sonuc: '+(pnl>=0?'+':'')+pnl.toFixed(2)+'%\n';
+  } else {
+    var isM = sig.type==='master';
+    var str = r.strength || calcStrength(r);
+    var bars = Math.round(str/2);
+    var gb = '';
+    for(var bi=0;bi<5;bi++) gb+=(bi<bars?'#':'_');
+    msg = (isM?'MASTER AI SINYALI':'AL SINYALI')+'\n--------------------\n'
+        + 'Hisse: '+sig.ticker+' - '+sig.name+'\n'
+        + 'TF: '+tfL+' | '+ts+'\n\n'
+        + 'Guc: ['+gb+'] '+str+'/10\n'
+        + 'Sinyal Fiyati: TL'+sigPrice+'\n'
+        + 'Anlik Fiyat: TL'+curPrice+'\n'
+        + 'AI Konsensus: %'+(r.cons||r.consensus||'-')+'\n';
+    if(r.currentStop) msg += 'Trailing Stop: TL'+r.currentStop+'\n';
+    if(TG&&TG.det) msg += 'ADX: '+(r.adx||'-')+' | PRO: '+(r.score||r.pro_score||'-')+'/6\n';
+    if(TG&&TG.q) msg += 'Bolge: '+(r.pstate||'NORMAL')+'\n';
+    if(TG&&TG.ag&&r.acts&&r.acts.length) msg += 'Sistemler: '+r.acts.join(' | ')+'\n';
+    if((sig.indices||[]).length) msg += 'Endeks: '+(sig.indices||[]).slice(0,3).join(', ')+'\n';
+  }
+  if(TG&&TG.ch) msg += '\nGrafik: '+chartUrl;
+  return msg;
+};
+
+// 5. TV linkler
+openTV = function(){
+  if(!S.curSig) return;
+  var tf = S.curSig.tf||'D';
+  var intv = tf==='D'?'1D':tf==='240'?'4H':'2H';
+  var url = 'https://www.tradingview.com/chart/?symbol=BIST:'+S.curSig.ticker+'&interval='+intv;
+  var modal = document.getElementById('modal');
+  if(modal) modal.classList.remove('on');
+  setTimeout(function(){ window.open(url,'_blank'); },100);
+};
+
+openTVTicker = function(ticker,tf){
+  var intv = (tf||'D')==='D'?'1D':tf==='240'?'4H':'2H';
+  setTimeout(function(){
+    window.open('https://www.tradingview.com/chart/?symbol=BIST:'+ticker+'&interval='+intv,'_blank');
+  },100);
+};
+
+// 6. Sinyal kalicilik - saveSigs/loadSigs
+function saveSigsLS(){
+  try{
+    var sv = (S.sigs||[]).slice(0,100).map(function(s){
+      return {
+        id:s.id, ticker:s.ticker, name:s.name||s.ticker,
+        indices:s.indices||[], type:s.type||'buy', tf:s.tf||'D',
+        time: s.time instanceof Date ? s.time.toISOString() : s.time,
+        res:{
+          price:s.res.price, signalPrice:s.res.signalPrice||s.res.price,
+          cons:s.res.cons, adx:s.res.adx, score:s.res.score,
+          fp:s.res.fp, pstate:s.res.pstate, acts:s.res.acts||[],
+          currentStop:s.res.currentStop, isMaster:s.res.isMaster,
+          strength:s.res.strength
+        }
+      };
+    });
+    localStorage.setItem('bist_sigs', JSON.stringify(sv));
   }catch(e){}
 }
-function loadSavedSigs(){
-  if(S.sigs&&S.sigs.length>0)return;
+
+function loadSigsLS(){
+  if(S.sigs && S.sigs.length > 0) return;
   try{
-    var saved=JSON.parse(localStorage.getItem('bist_sigs')||'[]');
-    if(!saved||!saved.length)return;
-    var cut=Date.now()-24*60*60*1000;
+    var saved = JSON.parse(localStorage.getItem('bist_sigs')||'[]');
+    if(!saved||!saved.length) return;
+    var cut = Date.now() - 24*60*60*1000;
     saved.forEach(function(s){
-      if(new Date(s.time).getTime()<cut)return;
-      S.sigs.push({id:s.id,ticker:s.ticker,name:s.name||s.ticker,indices:s.indices||[],
-        type:s.type||'buy',tf:s.tf||'D',time:new Date(s.time),res:s.res||{}});
+      if(new Date(s.time).getTime() < cut) return;
+      S.sigs.push({
+        id:s.id, ticker:s.ticker, name:s.name||s.ticker,
+        indices:s.indices||[], type:s.type||'buy', tf:s.tf||'D',
+        time:new Date(s.time), res:s.res||{}
+      });
     });
-    if(S.sigs.length>0){renderSigs();updateBadge();}
+    if(S.sigs.length > 0){ renderSigs(); updateBadge(); }
   }catch(e){}
 }
-window.addEventListener('load',function(){setTimeout(loadSavedSigs,600);});
+
+// Tarama sonrasi kaydet
+var _b4_origFP = renderPositions;
+// renderSigs zaten override edildi, oraya kaydet ekle
+var _b4_rsigsWithSave = renderSigs;
+renderSigs = function(){
+  _b4_rsigsWithSave.apply(this,arguments);
+  setTimeout(saveSigsLS, 200);
+};
+
+// 7. Piyasa saati
+function isPiyasaAcik(){
+  var now = new Date();
+  var g = now.getDay();
+  if(g===0||g===6) return false;
+  var t = now.getHours()*60+now.getMinutes();
+  return t >= 9*60+30 && t <= 18*60+15;
+}
+
+// 8. LOAD
+window.addEventListener('load',function(){
+  // Kaydedilmis sinyalleri yukle
+  setTimeout(loadSigsLS, 500);
+
+  // Her 2 dakikada canli fiyat
+  _b4_priceTimer = setInterval(function(){
+    b4FetchPrices();
+  }, 2*60*1000);
+
+  // Sayfa acilisinda hemen fiyat cek (5sn sonra)
+  setTimeout(b4FetchPrices, 5000);
+
+  // Piyasa saati gostergesi
+  setTimeout(function(){
+    var hst = document.getElementById('hst');
+    if(hst && !isPiyasaAcik()){
+      hst.textContent = 'Piyasa kapali';
+    }
+  }, 1500);
+});
+
+// AGENTS - Gercek veri
+renderAgents = function(){
+  // Agent tanimlari
+  var AGENTS = [
+    {id:'A60', name:'A60', sysKey:'a60', actKey:'A60'},
+    {id:'A61', name:'A61', sysKey:'a61', actKey:'A61'},
+    {id:'A62', name:'A62', sysKey:'a62', actKey:'A62'},
+    {id:'A81', name:'A81', sysKey:'a81', actKey:'A81'},
+    {id:'A120',name:'A120',sysKey:'a120',actKey:'A120'},
+    {id:'S1',  name:'Sys1',sysKey:'s1',  actKey:'ST+TMA'},
+    {id:'S2',  name:'Sys2',sysKey:'s2',  actKey:'PRO'},
+    {id:'FU',  name:'Fusion',sysKey:'fu',actKey:'Fusion'}
+  ];
+
+  // sigHistory'den her agent icin istatistik hesapla
+  var hist = S.sigHistory || [];
+  var closed = S.closedPositions || [];
+
+  AGENTS.forEach(function(ag){
+    var signals = 0;   // bu agent'in verdigi sinyal sayisi
+    var wins = 0;      // kazanali kapananlar
+    var losses = 0;    // zararli kapananlar
+    var totalPnl = 0;  // toplam PnL
+
+    // sigHistory'de bu agent'in sinyallerini bul
+    hist.forEach(function(h){
+      if(!h.acts) return;
+      if(h.acts.indexOf(ag.actKey) === -1) return;
+      if(h.type === 'stop') return;
+      signals++;
+    });
+
+    // closedPositions'da bu agent'in sinyallerinden kapananlari bul
+    closed.forEach(function(cp){
+      if(!cp.acts) return;
+      if(cp.acts.indexOf(ag.actKey) === -1) return;
+      var pnl = parseFloat(cp.pnlPct) || 0;
+      totalPnl += pnl;
+      if(pnl >= 0) wins++; else losses++;
+    });
+
+    var total = wins + losses;
+    ag.signals = signals;
+    ag.wins = wins;
+    ag.losses = losses;
+    ag.winRate = total > 0 ? (wins/total*100) : 0;
+    ag.avgPnl = total > 0 ? (totalPnl/total) : 0;
+    ag.active = !!C[ag.sysKey];
+  });
+
+  // Tablo render
+  var tbl = document.getElementById('agTbl');
+  if(!tbl) return;
+
+  var html = '';
+  AGENTS.forEach(function(ag){
+    var wrClr = ag.winRate >= 55 ? 'var(--green)' : ag.winRate >= 45 ? 'var(--gold)' : 'var(--red)';
+    var pnlClr = ag.avgPnl >= 0 ? 'var(--green)' : 'var(--red)';
+    var pnlStr = ag.avgPnl >= 0 ? '+'+ag.avgPnl.toFixed(1)+'%' : ag.avgPnl.toFixed(1)+'%';
+    var repW = ag.signals > 0 ? Math.min(100, ag.winRate) : 0;
+
+    html += '<tr>'
+      + '<td style="color:var(--cyan);font-weight:600">' + ag.name + '</td>'
+      + '<td style="color:' + (ag.active?'var(--green)':'var(--t3)') + '">' + (ag.active?'OK':'X') + '</td>'
+      + '<td style="color:' + pnlClr + ';font-family:Courier New,monospace">'
+        + (ag.signals > 0 ? pnlStr : '-') + '</td>'
+      + '<td>'
+        + '<div style="display:flex;align-items:center;gap:4px">'
+        + '<div class="rbar"><div class="rfill" style="width:'+repW+'%"></div></div>'
+        + '<span style="font-size:9px;color:' + wrClr + '">'
+          + (ag.signals > 0 ? ag.winRate.toFixed(0)+'%' : '-') + '</span>'
+        + '</div>'
+      + '</td>'
+      + '<td style="font-size:9px;color:var(--t3)">'
+        + (ag.signals > 0 ? ag.signals + ' sig' : '-') + '</td>'
+      + '</tr>';
+  });
+  tbl.innerHTML = html;
+
+  // Master AI stats - son taramadan gelen gercek degerler
+  // S.sigs'den son master sinyalin konsensusunu al
+  var lastMaster = null;
+  for(var i=0;i<S.sigs.length;i++){
+    if(S.sigs[i].type==='master' && S.sigs[i].res){
+      lastMaster = S.sigs[i]; break;
+    }
+  }
+
+  var mcons = document.getElementById('mcons');
+  var mthresh = document.getElementById('mthresh');
+  var mpnl = document.getElementById('mpnl');
+  var mpos = document.getElementById('mpos');
+
+  if(mcons){
+    if(lastMaster && lastMaster.res.cons){
+      mcons.textContent = '%' + parseFloat(lastMaster.res.cons).toFixed(1);
+      mcons.style.color = parseFloat(lastMaster.res.cons) >= 70 ? 'var(--green)' : 'var(--gold)';
+    } else {
+      // XU100 bazli tahmini konsensus
+      var estCons = S.xu100Change > 1 ? 65 : S.xu100Change > 0 ? 55 : S.xu100Change > -1 ? 45 : 35;
+      mcons.textContent = '%~'+estCons;
+      mcons.style.color = 'var(--t3)';
+    }
+  }
+  if(mthresh) mthresh.textContent = '%'+(C.mb||70);
+
+  // Master PnL - kapali pozisyonlardan hesapla
+  var masterClosed = closed.filter(function(cp){
+    return cp.acts && (cp.acts.indexOf('Master')<0 ? false : true) ||
+           (lastMaster && cp.ticker === lastMaster.ticker);
+  });
+  var masterPnlTotal = 0;
+  closed.forEach(function(cp){ masterPnlTotal += parseFloat(cp.pnlPct)||0; });
+  if(mpnl){
+    if(closed.length > 0){
+      var avgP = (masterPnlTotal/closed.length);
+      mpnl.textContent = (avgP>=0?'+':'')+avgP.toFixed(2)+'%';
+      mpnl.style.color = avgP>=0?'var(--green)':'var(--red)';
+    } else {
+      mpnl.textContent = '-';
+    }
+  }
+  if(mpos){
+    var posCount = Object.keys(S.openPositions||{}).length;
+    mpos.textContent = posCount > 0 ? posCount+' ACIK' : 'YOK';
+    mpos.style.color = posCount > 0 ? 'var(--gold)' : 'var(--t3)';
+  }
+
+  // Quantum viz - pstate dagilimini gercek sigHistory'den hesapla
+  var pstates = {
+    'COK UCUZ':0,'UCUZ':0,'NORMAL':0,'PAHALI':0,'COK PAHALI':0,'BELIRSIZ':0
+  };
+  var pTotal = 0;
+  var recentHist = hist.slice(0,200);
+  recentHist.forEach(function(h){
+    if(h.type==='stop') return;
+    // pstate yok - type ve strength'e gore tahmin et
+    var str = h.strength || 5;
+    if(str >= 8) pstates['UCUZ']++;
+    else if(str >= 6) pstates['NORMAL']++;
+    else if(str >= 4) pstates['PAHALI']++;
+    else pstates['BELIRSIZ']++;
+    pTotal++;
+  });
+
+  // Son sinyallerde pstate varsa onu kullan
+  S.sigs.forEach(function(s){
+    if(s.res && s.res.pstate && s.type!=='stop'){
+      var ps = s.res.pstate;
+      if(pstates[ps] !== undefined){ pstates[ps]++; pTotal++; }
+    }
+  });
+
+  var qv = document.getElementById('qviz');
+  if(!qv) return;
+  var qKeys = ['COK UCUZ','UCUZ','NORMAL','PAHALI','COK PAHALI'];
+  var qClrs = ['#00c853','#69f0ae','#ff9800','#ef5350','#b71c1c'];
+  var qHtml = '';
+  if(pTotal === 0){
+    qHtml = '<div style="font-size:10px;color:var(--t4);padding:8px">Henuz sinyal verisi yok. Tarama sonrasi dolacak.</div>';
+  } else {
+    qKeys.forEach(function(k,i){
+      var pct = pTotal > 0 ? Math.round(pstates[k]/pTotal*100) : 0;
+      if(pct === 0) return;
+      qHtml += '<div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">'
+        + '<div style="width:70px;font-size:9px;color:var(--t3)">' + k + '</div>'
+        + '<div style="flex:1;height:5px;background:var(--b2);border-radius:3px;overflow:hidden">'
+          + '<div style="height:100%;width:'+pct+'%;background:'+qClrs[i]+';border-radius:3px"></div></div>'
+        + '<div style="font-size:9px;color:'+qClrs[i]+';width:28px;text-align:right;font-weight:600">'+pct+'%</div>'
+        + '</div>';
+    });
+    // Son guncelleme
+    qHtml += '<div style="font-size:8px;color:var(--t4);margin-top:4px">'
+      + pTotal + ' sinyal analiz edildi</div>';
+  }
+  qv.innerHTML = qHtml;
+};
+
+
+// SW / Push Permission - iOS uyumlu
+requestPushPermission = function(){
+  if(!('Notification' in window)){
+    toast('Bu tarayici bildirim desteklemiyor. Telegram kullanin.');
+    return;
+  }
+  if(Notification.permission === 'granted'){
+    toast('Push izni zaten var!');
+    var d = document.getElementById('bgDot');
+    if(d) d.className = 'bg-dot on';
+    return;
+  }
+  if(Notification.permission === 'denied'){
+    toast('Bildirim engellendi. Ayarlar > Safari > Bildirimler bolumunden acin.');
+    return;
+  }
+  // iOS icin callback + Promise her ikisini de dene
+  try {
+    var result = Notification.requestPermission(function(p){
+      // Eski iOS - callback
+      if(p === 'granted'){
+        toast('Push izni verildi!');
+        var d = document.getElementById('bgDot');
+        if(d) d.className = 'bg-dot on';
+      } else {
+        toast('Izin verilmedi. Telegram bildirimleri aktif kalir.');
+      }
+    });
+    // Yeni tarayicilar Promise donduruyor
+    if(result && typeof result.then === 'function'){
+      result.then(function(p){
+        if(p === 'granted'){
+          toast('Push izni verildi!');
+          var d = document.getElementById('bgDot');
+          if(d) d.className = 'bg-dot on';
+        } else {
+          toast('Izin verilmedi. Telegram aktif kalir.');
+        }
+      }).catch(function(e){
+        toast('Hata: ' + (e.message||'Bilinmeyen hata'));
+      });
+    }
+  } catch(e) {
+    toast('Hata: ' + (e.message||'Bildirim izni alinamadi'));
+  }
+};
+
+</script>
+<script>
+
+// 
+// BIST v6 BLOK 5 - MEGA GELISTIRME
+// 1. Pozisyonlar (acik+kapali gecmis + son 5 sinyal)
+// 2. Rapor sekmesi
+// 3. Backtest + Optimizasyon
+// 4. Trader Gozetimi (AI tabanli)
+// 5. False Sinyal Analizi (AI tabanli)
+// 6. Hisse ismine tikla -> TradingView
+// 
+
+//  YARDIMCI 
+function fmtPct(v){ v=parseFloat(v); return (v>=0?'+':'')+v.toFixed(2)+'%'; }
+function fmtTL(v){ return 'TL'+parseFloat(v).toFixed(2); }
+function pnlClr(v){ return parseFloat(v)>=0?'var(--green)':'var(--red)'; }
+function fmtDate(d){ var dt=new Date(d); return ('0'+dt.getDate()).slice(-2)+'/'+('0'+(dt.getMonth()+1)).slice(-2)+'/'+dt.getFullYear()+' '+('0'+dt.getHours()).slice(-2)+':'+('0'+dt.getMinutes()).slice(-2); }
+function pstateClr(ps){ var p=(ps||'').toUpperCase(); if(p==='COK UCUZ')return'#00c853'; if(p==='UCUZ')return'#69f0ae'; if(p==='PAHALI')return'#ef5350'; if(p==='COK PAHALI')return'#b71c1c'; return'#ff9800'; }
+
+//  1. POZISYONLAR - KAPALI GECMIS 
+renderClosedPositions = function(){
+  var el = document.getElementById('closedList');
+  if(!el) return;
+  var closed = S.closedPositions || [];
+  if(!closed.length){
+    el.innerHTML = '<div class="empty"><div class="eico">&#128218;</div><div style="font-size:11px">Kapanmis pozisyon yok.</div></div>';
+    return;
+  }
+
+  // Ozet istatistikler
+  var totalPnl=0, wins=0, totalHold=0, bestPnl=-999, worstPnl=999, bestTicker='', worstTicker='';
+  closed.forEach(function(p){
+    var pnl=parseFloat(p.pnlPct);
+    totalPnl+=pnl; if(pnl>=0)wins++; totalHold+=(p.holdDays||0);
+    if(pnl>bestPnl){bestPnl=pnl;bestTicker=p.ticker;} if(pnl<worstPnl){worstPnl=pnl;worstTicker=p.ticker;}
+  });
+  var wr=(wins/closed.length*100).toFixed(1);
+  var avgPnl=(totalPnl/closed.length).toFixed(2);
+  var avgHold=(totalHold/closed.length).toFixed(0);
+
+  // PnL dagilim grafigi
+  var chartBars = '';
+  var maxAbs = Math.max.apply(null, closed.map(function(p){return Math.abs(parseFloat(p.pnlPct));})) || 1;
+  var recent = closed.slice(0,30);
+  chartBars = recent.map(function(p){
+    var pnl=parseFloat(p.pnlPct); var h=Math.round(Math.abs(pnl)/maxAbs*40);
+    var clr=pnl>=0?'var(--green)':'var(--red)';
+    return '<div title="'+p.ticker+' '+fmtPct(pnl)+'" style="display:inline-flex;flex-direction:column;align-items:center;width:14px;gap:1px;cursor:pointer" onclick="openTVTicker(\''+p.ticker+'\',\''+p.tf+'\')">'
+      +(pnl>=0?'<div style="height:'+h+'px;width:8px;background:'+clr+';border-radius:2px 2px 0 0;margin-top:auto"></div><div style="height:2px;width:12px;background:var(--b2)"></div>'
+              :'<div style="height:2px;width:12px;background:var(--b2)"></div><div style="height:'+h+'px;width:8px;background:'+clr+';border-radius:0 0 2px 2px"></div>')
+      +'</div>';
+  }).join('');
+
+  // Sistem bazli performans
+  var sysPnl = {}; var sysCount = {};
+  var sysMap = {'ST+TMA':'S1','PRO':'S2','Fusion':'FU','A60':'A60','A61':'A61','A62':'A62','A81':'A81','A120':'A120'};
+  closed.forEach(function(p){
+    var acts = p.acts||[];
+    acts.forEach(function(a){
+      if(!sysMap[a]) return;
+      var k=sysMap[a];
+      sysPnl[k]=(sysPnl[k]||0)+parseFloat(p.pnlPct);
+      sysCount[k]=(sysCount[k]||0)+1;
+    });
+  });
+
+  var html = '<div class="card" style="margin-bottom:8px;border-color:rgba(0,212,255,.15)">'
+    + '<div class="ctitle" style="color:var(--cyan)">Kapali Pozisyon Ozeti</div>'
+    + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:10px">'
+    + '<div class="sstat"><div class="sval '+(parseFloat(totalPnl)>=0?'p':'n')+'">'+fmtPct(totalPnl)+'</div><div class="slb2">Toplam PnL</div></div>'
+    + '<div class="sstat"><div class="sval" style="color:'+(parseFloat(wr)>=50?'var(--green)':'var(--red)')+'">'+wr+'%</div><div class="slb2">Win Rate</div></div>'
+    + '<div class="sstat"><div class="sval">'+avgHold+'g</div><div class="slb2">Ort. Sure</div></div>'
+    + '<div class="sstat"><div class="sval '+(parseFloat(avgPnl)>=0?'p':'n')+'">'+fmtPct(avgPnl)+'</div><div class="slb2">Ort. PnL</div></div>'
+    + '<div class="sstat"><div class="sval" style="color:var(--green);font-size:14px">'+bestTicker+'</div><div class="slb2">En Iyi</div></div>'
+    + '<div class="sstat"><div class="sval" style="color:var(--red);font-size:14px">'+worstTicker+'</div><div class="slb2">En Kotu</div></div>'
+    + '</div>'
+    // PnL chart
+    + '<div style="font-size:9px;color:var(--t4);margin-bottom:5px">Son '+recent.length+' islem PnL dagilimi (tikla -> grafik)</div>'
+    + '<div style="display:flex;align-items:center;height:52px;gap:2px;overflow-x:auto;padding:2px 0">'+chartBars+'</div>'
+    + '</div>';
+
+  // Sistem bazli performans kartlari
+  if(Object.keys(sysCount).length > 0){
+    html += '<div class="card" style="margin-bottom:8px"><div class="ctitle">Sistem Performansi</div>'
+      + '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:4px">';
+    Object.keys(sysCount).forEach(function(k){
+      var avg=(sysPnl[k]/sysCount[k]).toFixed(2);
+      html += '<div style="background:var(--bg3);border-radius:7px;padding:9px;border:1px solid var(--b2)">'
+        + '<div style="font-size:11px;font-weight:700;color:var(--cyan)">'+k+'</div>'
+        + '<div style="font-size:17px;font-weight:700;color:'+pnlClr(avg)+';font-family:Courier New,monospace">'+fmtPct(avg)+'</div>'
+        + '<div style="font-size:9px;color:var(--t4)">'+sysCount[k]+' islem</div>'
+        + '</div>';
+    });
+    html += '</div></div>';
+  }
+
+  // Her hissenin son 5 sinyali
+  html += '<div class="card" style="margin-bottom:8px"><div class="ctitle">Hisse Bazli Son 5 Sinyal</div>'
+    + '<div id="tickerSignalList" style="max-height:280px;overflow-y:auto"></div></div>';
+
+  // Kapali pozisyon kartlari
+  html += '<div class="ctitle" style="margin:8px 0 6px">Islem Gecmisi ('+closed.length+')</div>';
+  closed.forEach(function(p){
+    var pnl=parseFloat(p.pnlPct);
+    var profitBar=''; var barW=Math.min(100,Math.abs(pnl)/maxAbs*100);
+    profitBar='<div style="height:3px;background:var(--b2);border-radius:2px;margin:5px 0;overflow:hidden"><div style="height:100%;width:'+barW+'%;background:'+pnlClr(pnl)+';border-radius:2px"></div></div>';
+    html += '<div class="pos-card '+(pnl>=0?'profit':'loss')+'" style="cursor:pointer" onclick="openTVTicker(\''+p.ticker+'\',\''+p.tf+'\')">'
+      + '<div class="pos-header">'
+      + '<div><div class="pos-ticker" style="font-size:16px">'+p.ticker+'</div>'
+      + '<div style="font-size:9px;color:var(--t4)">'+p.tf+' | '+(p.holdDays||0)+' gun | '+(p.entryTime?fmtDate(p.entryTime):'-')+'</div></div>'
+      + '<div style="text-align:right"><div class="pos-pnl" style="color:'+pnlClr(pnl)+'">'+fmtPct(pnl)+'</div>'
+      + '<div style="font-size:10px;color:var(--t4)">Giris: '+fmtTL(p.entry)+' Cikis: '+fmtTL(p.exit)+'</div></div>'
+      + '</div>'
+      + profitBar
+      + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:3px;margin-top:4px">'
+      + '<div class="pos-m"><div class="pos-mv" style="font-size:10px">'+((p.cons||'-')+'%')+'</div><div class="pos-ml">Kons.</div></div>'
+      + '<div class="pos-m"><div class="pos-mv" style="font-size:10px">'+(p.adx||'-')+'</div><div class="pos-ml">ADX</div></div>'
+      + '<div class="pos-m"><div class="pos-mv" style="font-size:10px;color:'+pstateClr(p.pstate)+'">'+(p.pstate||'-')+'</div><div class="pos-ml">Bolge</div></div>'
+      + '<div class="pos-m"><div class="pos-mv" style="font-size:9px;color:var(--t4)">'+(p.reason==='stop'?'STOP':'MANUEL')+'</div><div class="pos-ml">Cikis</div></div>'
+      + '</div>'
+      + '<div style="margin-top:5px;display:flex;flex-wrap:wrap;gap:3px">'
+      + (p.acts||[]).map(function(a){return'<span style="font-size:8px;padding:2px 5px;background:rgba(0,212,255,.1);color:var(--cyan);border-radius:3px">'+a+'</span>';}).join('')
+      + '</div>'
+      + '</div>';
+  });
+
+  el.innerHTML = html;
+
+  // Hisse bazli son 5 sinyal yukle
+  renderTickerSignals();
+};
+
+function renderTickerSignals(){
+  var el = document.getElementById('tickerSignalList');
+  if(!el) return;
+  var closed = S.closedPositions || [];
+  var hist = S.sigHistory || [];
+  // Benzersiz ticker'lar
+  var tickers = {};
+  closed.forEach(function(p){ tickers[p.ticker]=true; });
+  hist.forEach(function(h){ tickers[h.ticker]=true; });
+  var tickerList = Object.keys(tickers);
+  if(!tickerList.length){ el.innerHTML='<div style="color:var(--t4);font-size:10px;padding:8px">Veri yok</div>'; return; }
+  var html = '';
+  tickerList.slice(0,20).forEach(function(ticker){
+    // Bu hissenin sigHistory'deki sinyalleri
+    var sigs = hist.filter(function(h){ return h.ticker===ticker; }).slice(0,5);
+    if(!sigs.length) return;
+    html += '<div style="margin-bottom:8px;padding:8px;background:var(--bg3);border-radius:7px;border:1px solid var(--b2)">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">'
+      + '<span style="font-size:13px;font-weight:700;color:var(--t1);cursor:pointer" onclick="openTVTicker(\''+ticker+'\',\'D\')">'+ticker+'</span>'
+      + '<span style="font-size:8px;color:var(--t4)">Son '+sigs.length+' sinyal</span></div>'
+      + '<div style="display:flex;gap:3px;flex-wrap:wrap">';
+    sigs.forEach(function(s){
+      var dt=new Date(s.time);
+      var ds=('0'+dt.getDate()).slice(-2)+'/'+('0'+(dt.getMonth()+1)).slice(-2);
+      var clr=s.type==='master'?'var(--gold)':s.type==='stop'?'var(--orange)':'var(--green)';
+      var lbl=s.type==='master'?'M':s.type==='stop'?'S':'AL';
+      html+='<div style="background:var(--bg2);border:1px solid var(--b2);border-radius:5px;padding:4px 7px;text-align:center">'
+        +'<div style="font-size:10px;font-weight:700;color:'+clr+'">'+lbl+'</div>'
+        +'<div style="font-size:8px;color:var(--t4)">'+ds+'</div>'
+        +(s.price>0?'<div style="font-size:8px;color:var(--t3);font-family:Courier New,monospace">TL'+parseFloat(s.price).toFixed(1)+'</div>':'')
+        +'</div>';
+    });
+    html += '</div></div>';
+  });
+  el.innerHTML = html || '<div style="color:var(--t4);font-size:10px;padding:8px">Sinyal gecmisi bos</div>';
+}
+
+// Pozisyon sekmesi acilinca renderTickerSignals calistir
+var _b5_origPosTab = posTab;
+posTab = function(tab){
+  _b5_origPosTab.apply(this,arguments);
+  if(tab==='closed') setTimeout(renderTickerSignals,100);
+};
+
+//  2. RAPOR SEKMESI - GELISTIRILMIS 
+renderReport = function(){
+  var now=new Date(); var wAgo=new Date(now.getTime()-7*86400000);
+  var hist=S.sigHistory||[]; var closed=S.closedPositions||[];
+  var wSigs=hist.filter(function(s){return new Date(s.time)>=wAgo;});
+  var mSigs=wSigs.filter(function(s){return s.type==='master';});
+  var sSigs=wSigs.filter(function(s){return s.type==='stop';});
+
+  // Bu hafta istatistik
+  function sv(id,v,c2){var e=document.getElementById(id);if(e){e.textContent=v;if(c2)e.style.color=c2;}}
+  sv('wkSigs',wSigs.length); sv('wkMaster',mSigs.length); sv('wkStops',sSigs.length);
+
+  // En aktif hisse
+  var tc={};
+  wSigs.forEach(function(s){tc[s.ticker]=(tc[s.ticker]||0)+1;});
+  var sorted=Object.keys(tc).sort(function(a,b){return tc[b]-tc[a];});
+  sv('wkBest',sorted[0]||'-');
+
+  // --- HAFTALIK PNL OZETI ---
+  var wClosed=closed.filter(function(p){return new Date(p.exitTime||p.entryTime)>=wAgo;});
+  var wPnl=0; wClosed.forEach(function(p){wPnl+=parseFloat(p.pnlPct||0);});
+  var wPnlEl=document.getElementById('wkPnl');
+  if(!wPnlEl){
+    // Dinamik ekle
+    var wkCard=document.querySelector('#wkSigs')&&document.querySelector('#wkSigs').closest('.card');
+    if(wkCard){
+      var div=document.createElement('div');
+      div.innerHTML='<div class="sstat"><div class="sval" id="wkPnl">'+fmtPct(wPnl)+'</div><div class="slb2">Haftalik PnL</div></div>';
+      var sgrid=wkCard.querySelector('.sgrid');
+      if(sgrid) sgrid.appendChild(div.firstChild);
+    }
+  } else { wPnlEl.textContent=fmtPct(wPnl); wPnlEl.style.color=pnlClr(wPnl); }
+
+  // Sistem performansi
+  var sc={'ST+TMA':0,'PRO':0,'Fusion':0,'A60':0,'A61':0,'A62':0,'A81':0,'A120':0};
+  wSigs.forEach(function(s){(s.acts||[]).forEach(function(a){if(sc[a]!==undefined)sc[a]++;});});
+  var spEl=document.getElementById('sysPerf');
+  if(spEl){
+    var spH='';
+    Object.keys(sc).sort(function(a,b){return sc[b]-sc[a];}).forEach(function(k){
+      if(!sc[k]) return;
+      var pct=wSigs.length?Math.round(sc[k]/wSigs.length*100):0;
+      var clr=k==='PRO'||k==='ST+TMA'?'var(--cyan)':k==='Fusion'?'var(--purple)':'var(--gold)';
+      spH+='<div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">'
+        +'<div style="width:58px;font-size:10px;color:var(--t2)">'+k+'</div>'
+        +'<div style="flex:1;height:5px;background:var(--b2);border-radius:3px;overflow:hidden">'
+          +'<div style="height:100%;width:'+pct+'%;background:'+clr+';border-radius:3px"></div></div>'
+        +'<div style="font-size:9px;color:var(--t3);width:36px;text-align:right">'+sc[k]+'x</div></div>';
+    });
+    spEl.innerHTML=spH||'<div style="color:var(--t4);font-size:10px">Veri yok</div>';
+  }
+
+  // Takvim - son 28 gun
+  var calEl=document.getElementById('calGrid');
+  if(calEl){
+    var calH='';
+    for(var d=27;d>=0;d--){
+      var day=new Date(now.getTime()-d*86400000); var ds=day.toDateString();
+      var ds2=hist.filter(function(s){return new Date(s.time).toDateString()===ds;});
+      var wk=day.getDay()===0||day.getDay()===6;
+      var cls='cal-day'+(wk?' none':ds2.length>=5?' good':ds2.length>0?' has':' none');
+      calH+='<div class="'+cls+'" title="'+day.toLocaleDateString('tr-TR')+': '+ds2.length+' sinyal">'+(ds2.length>0?ds2.length:day.getDate())+'</div>';
+    }
+    calEl.innerHTML=calH;
+  }
+
+  // En cok sinyal
+  var tsEl=document.getElementById('topStocks');
+  if(tsEl){
+    var tsH=sorted.slice(0,8).map(function(t,i){
+      var cached=S.priceCache[t]; var prStr=cached?(' <span style="color:var(--cyan);font-family:Courier New,monospace">TL'+cached.price.toFixed(2)+'</span>'):'';
+      return'<div class="rep-row" style="cursor:pointer" onclick="openTVTicker(\''+t+'\',\'D\')">'
+        +'<span style="color:var(--t3)">'+(i+1)+'. <b style="color:var(--t1)">'+t+'</b>'+prStr+'</span>'
+        +'<span style="color:var(--cyan)">'+tc[t]+' sinyal</span></div>';
+    }).join('');
+    tsEl.innerHTML=tsH||'<div style="color:var(--t4);font-size:10px;padding:8px 0">Veri yok</div>';
+  }
+
+  // PnL grafigi - kapali pozisyonlar
+  var pnlChartEl=document.getElementById('pnlChart');
+  if(pnlChartEl && closed.length){
+    var runPnl=0; var points=closed.slice().reverse().map(function(p){
+      runPnl+=parseFloat(p.pnlPct); return runPnl.toFixed(2);
+    });
+    var maxP=Math.max.apply(null,points.map(Math.abs))||1;
+    var ch='<div style="position:relative;height:80px;background:var(--bg3);border-radius:7px;overflow:hidden;margin-bottom:8px">';
+    ch+='<div style="position:absolute;bottom:0;left:0;right:0;height:1px;background:var(--b2)"></div>';
+    ch+='<div style="position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:flex-end;gap:1px;padding:2px">';
+    points.forEach(function(v){
+      var pct=Math.round(Math.abs(parseFloat(v))/maxP*36);
+      var pos=parseFloat(v)>=0;
+      ch+='<div style="flex:1;height:'+pct+'px;background:'+(pos?'var(--green)':'var(--red)')+';border-radius:1px;'+(pos?'':'margin-top:auto')+';opacity:.8" title="'+v+'%"></div>';
+    });
+    ch+='</div></div>';
+    ch+='<div style="display:flex;justify-content:space-between;font-size:8px;color:var(--t4)">'
+      +'<span>Baslangic</span><span style="color:'+(parseFloat(runPnl)>=0?'var(--green)':'var(--red)')+';font-weight:700">Toplam: '+fmtPct(runPnl)+'</span><span>Son</span></div>';
+    pnlChartEl.innerHTML=ch;
+  }
+
+  // Gunluk sinyal yogunlugu
+  renderHeatmap();
+};
+
+function renderHeatmap(){
+  var el=document.getElementById('heatmap');
+  if(!el) return;
+  var hist=S.sigHistory||[];
+  var hourCounts=new Array(24).fill(0);
+  hist.slice(0,500).forEach(function(s){
+    var h=new Date(s.time).getHours();
+    hourCounts[h]++;
+  });
+  var maxH=Math.max.apply(null,hourCounts)||1;
+  var html='<div style="display:flex;gap:2px;align-items:flex-end;height:40px">';
+  for(var h=9;h<=18;h++){
+    var pct=Math.round(hourCounts[h]/maxH*100);
+    var isPeak=pct>=70; var isMarket=h>=9&&h<=18;
+    html+='<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:2px">'
+      +'<div style="flex:1;display:flex;align-items:flex-end">'
+        +'<div style="width:100%;height:'+(pct||2)+'%;background:'+(isPeak?'var(--gold)':'var(--cyan)')+';border-radius:2px;opacity:'+(isMarket?1:0.4)+';min-height:2px"></div></div>'
+      +'<div style="font-size:7px;color:var(--t4)">'+h+'</div>'
+      +'</div>';
+  }
+  html+='</div>';
+  el.innerHTML=html;
+}
+
+// Rapor HTML'e PnL chart + heatmap ekle
+window.addEventListener('load',function(){
+  setTimeout(function(){
+    var repPage=document.getElementById('page-report');
+    if(!repPage) return;
+    // PnL kumulatif chart
+    var pnlDiv=document.createElement('div');
+    pnlDiv.className='card';
+    pnlDiv.innerHTML='<div class="ctitle" style="color:var(--green)">Kumulatif PnL</div><div id="pnlChart"></div>';
+    // Heatmap
+    var hmDiv=document.createElement('div');
+    hmDiv.className='card';
+    hmDiv.innerHTML='<div class="ctitle">Saatlik Sinyal Yogunlugu</div><div id="heatmap"></div>';
+    // Butunlestirici
+    var lastCard=repPage.querySelector('.card:last-child');
+    if(lastCard){ repPage.insertBefore(pnlDiv,lastCard); repPage.insertBefore(hmDiv,lastCard); }
+    else{ repPage.appendChild(pnlDiv); repPage.appendChild(hmDiv); }
+  },1000);
+});
+
+//  3. TRADER GOZETIMI - AI TABANLI 
+openTraderConsole = function(){
+  var posCount=Object.keys(S.openPositions||{}).length;
+  var closed=S.closedPositions||[];
+  var hist=S.sigHistory||[];
+  var totalPnl=0; var wins=0;
+  closed.forEach(function(p){var pnl=parseFloat(p.pnlPct);totalPnl+=pnl;if(pnl>=0)wins++;});
+  var wr=closed.length?(wins/closed.length*100).toFixed(1):'N/A';
+  var avgPnl=closed.length?(totalPnl/closed.length).toFixed(2):'N/A';
+
+  // Acik pozisyon PnL
+  var openPnl=0; var worstPos=null; var worstPnl=999;
+  Object.keys(S.openPositions).forEach(function(key){
+    var pos=S.openPositions[key]; var ticker=key.split('_')[0];
+    var cached=S.priceCache[ticker];
+    if(cached&&cached.price>0){
+      var pnl=(cached.price-pos.entry)/pos.entry*100;
+      openPnl+=pnl;
+      if(pnl<worstPnl){worstPnl=pnl;worstPos=ticker;}
+    }
+  });
+
+  // Risk metrikleri
+  var xu=S.xu100Change||0;
+  var riskScore=0;
+  if(posCount>=5) riskScore+=30;
+  else if(posCount>=3) riskScore+=15;
+  if(xu<=-2) riskScore+=25;
+  else if(xu<=-1) riskScore+=10;
+  if(parseFloat(wr)<45&&closed.length>=5) riskScore+=20;
+  if(parseFloat(avgPnl)<0) riskScore+=15;
+  if(worstPnl<-10) riskScore+=10;
+  var riskLvl=riskScore>=60?'YUKSEK':riskScore>=30?'ORTA':'DUSUK';
+  var riskClr=riskScore>=60?'var(--red)':riskScore>=30?'var(--gold)':'var(--green)';
+
+  // AI onerileri - kural bazli uzman sistem
+  var oneriler=[];
+  var uyarilar=[];
+
+  // Pozisyon yonetimi
+  if(posCount===0&&hist.length>0){
+    oneriler.push({o:'Aktif pozisyon yok - tarama yapip yeni sinyal bekleyin',p:'EYLEM',c:'var(--cyan)'});
+  }
+  if(posCount>=5){
+    uyarilar.push({o:'5+ acik pozisyon: Portfoy yogunlasma riski. Yeni giris yapmayin',p:'KRITIK',c:'var(--red)'});
+  }
+  if(worstPos&&worstPnl<-8){
+    uyarilar.push({o:worstPos+' pozisyonu -'+Math.abs(worstPnl).toFixed(1)+'% zararda. Stop seviyesini kontrol edin',p:'UYARI',c:'var(--orange)'});
+  }
+
+  // Piyasa durumu
+  if(xu<=-2){
+    uyarilar.push({o:'XU100 '+xu.toFixed(2)+'% - Piyasa zayif. Yeni AL sinyallerini atlayin',p:'DIKKAT',c:'var(--orange)'});
+  } else if(xu>=2){
+    oneriler.push({o:'XU100 +'+xu.toFixed(2)+'% - Piyasa guclu. Sinyaller daha guvenilir',p:'FIRSAT',c:'var(--green)'});
+  }
+
+  // Win rate analizi
+  if(closed.length>=5){
+    if(parseFloat(wr)<40){
+      uyarilar.push({o:'Win rate %'+wr+' - Cok dusuk. ADX esigini 30\'a cikarin ve Fusion esigini dusurun',p:'KRITIK',c:'var(--red)'});
+    } else if(parseFloat(wr)<50){
+      uyarilar.push({o:'Win rate %'+wr+' - Orta. PRO min skoru 5\'ten 6\'ya cikarin',p:'IYILESTIRME',c:'var(--gold)'});
+    } else if(parseFloat(wr)>=65){
+      oneriler.push({o:'Win rate %'+wr+' - Mukemmel! Mevcut parametreleri koruyun',p:'HARIKA',c:'var(--green)'});
+    }
+  }
+
+  // Ortalama PnL
+  if(parseFloat(avgPnl)<0){
+    uyarilar.push({o:'Ortalama PnL negatifte. Stop loss kurali sikilastirin: ATR carpani '+((C.atrm||8))+' -> '+(Math.max(6,(C.atrm||8)-1)),p:'KRITIK',c:'var(--red)'});
+  }
+
+  // Sistem etkinligi
+  if(!C.s1&&!C.s2&&!C.fu&&!C.ma){
+    uyarilar.push({o:'Hic sinyal sistemi aktif degil! Ayarlardan en az birini acin',p:'KRITIK',c:'var(--red)'});
+  }
+  if(C.s1&&C.s2&&C.fu&&C.ma&&!C.a60&&!C.a61){
+    oneriler.push({o:'Agent 60 veya 61 aktif edilerek konsensus guclendirilmeli',p:'ONERI',c:'var(--cyan)'});
+  }
+
+  // Telegram
+  if(!TG||!TG.token){
+    oneriler.push({o:'Telegram botu yapilandirilmamis. Ayarlar > Telegram bolumund yapilandirin',p:'ONERI',c:'var(--t3)'});
+  }
+
+  // Kelly Criterion pozisyon buyutu
+  if(closed.length>=10&&parseFloat(wr)>0){
+    var p=parseFloat(wr)/100;
+    var avgW=0; var avgL=0; var wc=0; var lc=0;
+    closed.forEach(function(cp){var pnl=parseFloat(cp.pnlPct);if(pnl>=0){avgW+=pnl;wc++;}else{avgL+=Math.abs(pnl);lc++;}});
+    if(wc&&lc){avgW/=wc;avgL/=lc;var b=avgW/avgL;var kelly=(p*b-(1-p))/b;var halfK=Math.max(0.01,Math.min(0.20,kelly*0.5));oneriler.push({o:'Kelly Criterion pozisyon buyutu: Sermayenin %'+(halfK*100).toFixed(1)+' (Tam Kelly: %'+(kelly*100).toFixed(1)+')',p:'BILGI',c:'var(--purple)'});}
+  }
+
+  // HTML olustur
+  var html='<div style="padding:3px 0">'
+    // Risk ozet
+    +'<div style="background:var(--bg3);border:1px solid var(--b2);border-radius:8px;padding:11px;margin-bottom:10px">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+    +'<span style="font-size:11px;font-weight:700;color:var(--t1)">Risk Durumu</span>'
+    +'<span style="font-size:13px;font-weight:700;padding:4px 12px;border-radius:5px;background:rgba(0,0,0,.3);color:'+riskClr+'">'+riskLvl+'</span></div>'
+    +'<div style="height:4px;background:var(--b2);border-radius:2px;overflow:hidden;margin-bottom:8px">'
+    +'<div style="height:100%;width:'+riskScore+'%;background:'+riskClr+';border-radius:2px;transition:width .3s"></div></div>'
+    +'<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:5px">'
+    +'<div class="sstat"><div class="sval" style="font-size:16px">'+posCount+'</div><div class="slb2">Acik Poz.</div></div>'
+    +'<div class="sstat"><div class="sval" style="font-size:16px;color:'+(parseFloat(wr)>=50?'var(--green)':'var(--red)')+'">'+wr+'%</div><div class="slb2">Win Rate</div></div>'
+    +'<div class="sstat"><div class="sval" style="font-size:16px;color:'+pnlClr(openPnl)+'">'+fmtPct(openPnl)+'</div><div class="slb2">Acik PnL</div></div>'
+    +'<div class="sstat"><div class="sval" style="font-size:16px;color:'+pnlClr(avgPnl||0)+'">'+fmtPct(avgPnl||0)+'</div><div class="slb2">Ort. PnL</div></div>'
+    +'</div></div>';
+
+  // Uyarilar
+  if(uyarilar.length){
+    html+='<div style="margin-bottom:8px"><div style="font-size:9px;font-weight:600;color:var(--t4);text-transform:uppercase;letter-spacing:2px;margin-bottom:6px">Uyarilar</div>';
+    uyarilar.forEach(function(u){
+      html+='<div style="display:flex;gap:7px;align-items:flex-start;padding:9px;background:rgba(0,0,0,.3);border:1px solid var(--b2);border-left:3px solid '+u.c+';border-radius:6px;margin-bottom:5px">'
+        +'<span style="font-size:8px;padding:2px 5px;border-radius:3px;background:rgba(0,0,0,.4);color:'+u.c+';flex-shrink:0;font-weight:700">'+u.p+'</span>'
+        +'<span style="font-size:10px;color:var(--t2);line-height:1.5">'+u.o+'</span></div>';
+    });
+    html+='</div>';
+  }
+
+  // Oneriler
+  if(oneriler.length){
+    html+='<div style="margin-bottom:8px"><div style="font-size:9px;font-weight:600;color:var(--t4);text-transform:uppercase;letter-spacing:2px;margin-bottom:6px">Oneriler</div>';
+    oneriler.forEach(function(u){
+      html+='<div style="display:flex;gap:7px;align-items:flex-start;padding:9px;background:rgba(0,0,0,.3);border:1px solid var(--b2);border-left:3px solid '+u.c+';border-radius:6px;margin-bottom:5px">'
+        +'<span style="font-size:8px;padding:2px 5px;border-radius:3px;background:rgba(0,0,0,.4);color:'+u.c+';flex-shrink:0;font-weight:700">'+u.p+'</span>'
+        +'<span style="font-size:10px;color:var(--t2);line-height:1.5">'+u.o+'</span></div>';
+    });
+    html+='</div>';
+  }
+
+  // Hizli aksiyonlar
+  html+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px">'
+    +'<button class="btn c" style="padding:10px;border-radius:8px;font-size:10px" onclick="startScan()">Tarama Baslat</button>'
+    +'<button class="btn g" style="padding:10px;border-radius:8px;font-size:10px" onclick="sendDayEndReport()">Gun Sonu Raporu</button>'
+    +'<button class="btn o" style="padding:10px;border-radius:8px;font-size:10px" onclick="sendWeeklyReport()">Haftalik Rapor</button>'
+    +'<button class="btn" style="padding:10px;border-radius:8px;font-size:10px" onclick="document.getElementById(\'modal\').classList.remove(\'on\');pg(\'settings\')">Ayarlar</button>'
+    +'</div>';
+
+  html+='</div>';
+
+  document.getElementById('mtit').textContent='Trader Gozetimi - AI Analiz';
+  document.getElementById('mcont').innerHTML=html;
+  document.getElementById('modal').classList.add('on');
+};
+
+//  4. FALSE SINYAL ANALIZI - GELISTIRILMIS 
+openFalseSignalAnalysis = function(){
+  var closed=S.closedPositions||[];
+  if(closed.length<3){toast('En az 3 kapali pozisyon gerekli!');return;}
+
+  var losses=closed.filter(function(p){return parseFloat(p.pnlPct)<0;});
+  var wins=closed.filter(function(p){return parseFloat(p.pnlPct)>=0;});
+  var falseRate=(losses.length/closed.length*100).toFixed(1);
+
+  // Metrik ortalamalari
+  function avg(arr,key){
+    if(!arr.length) return 0;
+    return arr.reduce(function(a,p){return a+parseFloat(p[key]||0);},0)/arr.length;
+  }
+  var avgConsFalse=avg(losses,'cons'); var avgConsTrue=avg(wins,'cons');
+  var avgAdxFalse=avg(losses,'adx'); var avgAdxTrue=avg(wins,'adx');
+  var avgScoreFalse=avg(losses,'score'); var avgScoreTrue=avg(wins,'score');
+
+  // Pstate analizi
+  var pstateFalse={};
+  losses.forEach(function(p){var ps=p.pstate||'NORMAL';pstateFalse[ps]=(pstateFalse[ps]||0)+1;});
+
+  // En iyi filtreler
+  var filters=[];
+
+  if(avgConsFalse<avgConsTrue-10){
+    filters.push({
+      tip:'Min Konsensus',
+      oneri:Math.ceil(avgConsTrue-5),
+      etki:'Potansiyel false sinyallerin %'+Math.round((losses.filter(function(p){return parseFloat(p.cons||0)<avgConsTrue-5;}).length/losses.length)*100)+' elimine eder',
+      clr:'var(--green)'
+    });
+  }
+  if(avgAdxFalse<avgAdxTrue-5){
+    filters.push({
+      tip:'Min ADX',
+      oneri:Math.ceil(avgAdxTrue-3),
+      etki:'Zayif trend sinyallerini filtreler',
+      clr:'var(--cyan)'
+    });
+  }
+  if(avgScoreFalse<avgScoreTrue-0.5){
+    filters.push({
+      tip:'Min PRO Skor',
+      oneri:Math.ceil(avgScoreTrue),
+      etki:'Dusuk kaliteli sinyalleri keser',
+      clr:'var(--gold)'
+    });
+  }
+
+  // Pahali bolgede false sinyal orani
+  var pahaliLoss=losses.filter(function(p){return p.pstate==='PAHALI'||p.pstate==='COK PAHALI';}).length;
+  if(pahaliLoss/losses.length>0.3){
+    filters.push({
+      tip:'Pahali Bolge Filtresi',
+      oneri:'PAHALI/COK PAHALI sinyallerini atla',
+      etki:'Toplam false sinyallerin %'+Math.round(pahaliLoss/losses.length*100)+' buradan geliyor',
+      clr:'var(--orange)'
+    });
+  }
+
+  // Trailing stop analizi
+  var stopAnaliz=[];
+  var atrVals=[4,5,6,7,8,9,10,12];
+  atrVals.forEach(function(atr){
+    var simWins=0; var simTotal=0;
+    closed.forEach(function(p){
+      simTotal++;
+      var stopDist=p.entry*0.022*atr;
+      var simStop=p.entry-stopDist;
+      var exitP=parseFloat(p.exit);
+      if(exitP>=simStop) simWins++;
+    });
+    stopAnaliz.push({atr:atr,wr:(simWins/simTotal*100).toFixed(1)});
+  });
+  stopAnaliz.sort(function(a,b){return parseFloat(b.wr)-parseFloat(a.wr);});
+  var bestStop=stopAnaliz[0];
+
+  // HTML
+  var html='<div style="padding:3px 0">'
+    // Ozet
+    +'<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:5px;margin-bottom:10px">'
+    +'<div class="sstat"><div class="sval" style="color:var(--red)">%'+falseRate+'</div><div class="slb2">False Sinyal Orani</div></div>'
+    +'<div class="sstat"><div class="sval">'+closed.length+'</div><div class="slb2">Toplam Sinyal</div></div>'
+    +'<div class="sstat"><div class="sval" style="color:var(--green)">'+wins.length+'</div><div class="slb2">Kazanali</div></div>'
+    +'<div class="sstat"><div class="sval" style="color:var(--red)">'+losses.length+'</div><div class="slb2">Zararli</div></div>'
+    +'</div>'
+
+    // Metrik kiyaslama
+    +'<div class="card" style="margin-bottom:8px;padding:10px">'
+    +'<div class="ctitle">Kazanan vs Kaybeden Metrikler</div>'
+    +'<table style="width:100%;font-size:10px;border-collapse:collapse">'
+    +'<tr><th style="text-align:left;color:var(--t4);padding:4px 0;border-bottom:1px solid var(--b2)">Metrik</th>'
+    +'<th style="color:var(--green);padding:4px;border-bottom:1px solid var(--b2)">Kazanan</th>'
+    +'<th style="color:var(--red);padding:4px;border-bottom:1px solid var(--b2)">Kaybeden</th></tr>'
+    +'<tr><td style="color:var(--t3);padding:5px 0">Konsensus</td><td style="color:var(--green);text-align:center">%'+avgConsTrue.toFixed(1)+'</td><td style="color:var(--red);text-align:center">%'+avgConsFalse.toFixed(1)+'</td></tr>'
+    +'<tr style="background:var(--bg3)"><td style="color:var(--t3);padding:5px">ADX</td><td style="color:var(--green);text-align:center">'+avgAdxTrue.toFixed(1)+'</td><td style="color:var(--red);text-align:center">'+avgAdxFalse.toFixed(1)+'</td></tr>'
+    +'<tr><td style="color:var(--t3);padding:5px 0">PRO Skor</td><td style="color:var(--green);text-align:center">'+avgScoreTrue.toFixed(1)+'</td><td style="color:var(--red);text-align:center">'+avgScoreFalse.toFixed(1)+'</td></tr>'
+    +'</table></div>'
+
+    // Trailing stop analizi
+    +'<div class="card" style="margin-bottom:8px;padding:10px">'
+    +'<div class="ctitle">En Iyi Trailing Stop</div>'
+    +'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:7px">';
+  stopAnaliz.slice(0,6).forEach(function(s){
+    var isBest=s.atr===bestStop.atr;
+    html+='<div style="background:'+(isBest?'rgba(0,230,118,.15)':'var(--bg3)')+';border:1px solid '+(isBest?'rgba(0,230,118,.4)':'var(--b2)')+';border-radius:6px;padding:7px 10px;text-align:center">'
+      +'<div style="font-size:12px;font-weight:700;color:'+(isBest?'var(--green)':'var(--t2)')+'">x'+s.atr+'</div>'
+      +'<div style="font-size:9px;color:var(--t4)">WR: '+s.wr+'%</div>'
+      +(isBest?'<div style="font-size:8px;color:var(--green)">BEST</div>':'')
+      +'</div>';
+  });
+  html+='</div>'
+    +'<button class="btn g" style="width:100%;padding:8px;border-radius:7px;font-size:10px" onclick="applyBestStop('+bestStop.atr+')">ATR x'+bestStop.atr+' Uygula (WR: '+bestStop.wr+'%)</button>'
+    +'</div>'
+
+    // Oneri edilen filtreler
+    +'<div style="margin-bottom:8px"><div style="font-size:9px;font-weight:600;color:var(--t4);text-transform:uppercase;letter-spacing:2px;margin-bottom:6px">AI Filter Onerileri</div>';
+
+  if(!filters.length){
+    html+='<div style="color:var(--green);font-size:10px;padding:8px">Mevcut parametreler iyi gorunuyor!</div>';
+  }
+  filters.forEach(function(f){
+    html+='<div style="padding:10px;background:var(--bg3);border:1px solid var(--b2);border-left:3px solid '+f.clr+';border-radius:7px;margin-bottom:5px">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+      +'<span style="font-size:11px;font-weight:700;color:'+f.clr+'">'+f.tip+'</span>'
+      +'<button class="btn" style="font-size:9px;padding:3px 8px" onclick="applyFalseSignalFix('+(typeof f.oneri==='number'?JSON.stringify({type:f.tip.toLowerCase(),val:f.oneri}):'null')+')">Uygula</button></div>'
+      +'<div style="font-size:10px;color:var(--t2)">Oneri: <b style="color:'+f.clr+'">'+f.oneri+'</b></div>'
+      +'<div style="font-size:9px;color:var(--t4);margin-top:3px">'+f.etki+'</div></div>';
+  });
+  html+='</div></div>';
+
+  document.getElementById('mtit').textContent='False Sinyal Analizi';
+  document.getElementById('mcont').innerHTML=html;
+  document.getElementById('modal').classList.add('on');
+};
+
+function applyBestStop(atrVal){
+  C.atrm=atrVal;
+  lsSet('bistcfg',C);
+  var el=document.getElementById('s_atrm');
+  if(el) el.value=atrVal;
+  toast('ATR Multiplier x'+atrVal+' uygulandi!');
+  document.getElementById('modal').classList.remove('on');
+}
+
+//  5. BACKTEST - GELISTIRILMIS RENDER 
+var _b5_origRenderBT = typeof renderBT === 'function' ? renderBT : null;
+renderBT = function(r){
+  if(_b5_origRenderBT) _b5_origRenderBT(r);
+  if(!r) return;
+  // Ek istatistikler - trades analizi
+  if(!r.trades||!r.trades.length) return;
+  var trEl = document.getElementById('btTradeDetail');
+  if(!trEl){
+    trEl=document.createElement('div');
+    trEl.id='btTradeDetail';
+    trEl.className='card';
+    var btout=document.getElementById('btout');
+    if(btout) btout.appendChild(trEl);
+  }
+  var closed2=r.trades.filter(function(t){return !t.open;});
+  if(!closed2.length) return;
+  var pnls=closed2.map(function(t){return parseFloat(t.p);});
+  var posT=pnls.filter(function(v){return v>0;}); var negT=pnls.filter(function(v){return v<0;});
+  var avgW=posT.length?posT.reduce(function(a,b){return a+b;},0)/posT.length:0;
+  var avgL=negT.length?negT.reduce(function(a,b){return a+b;},0)/negT.length:0;
+  var streak=0; var maxStreak=0; var lossStreak=0; var maxLossStreak=0;
+  pnls.forEach(function(p){ if(p>=0){streak++;lossStreak=0;if(streak>maxStreak)maxStreak=streak;} else{lossStreak++;streak=0;if(lossStreak>maxLossStreak)maxLossStreak=lossStreak;} });
+  var rr=avgL!==0?Math.abs(avgW/avgL).toFixed(2):'999';
+
+  trEl.innerHTML='<div class="ctitle" style="color:var(--purple)">Detayli Trade Analizi</div>'
+    +'<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:5px;margin-bottom:8px">'
+    +'<div class="sstat"><div class="sval" style="color:var(--green)">+'+avgW.toFixed(2)+'%</div><div class="slb2">Ort. Kazanc</div></div>'
+    +'<div class="sstat"><div class="sval" style="color:var(--red)">'+avgL.toFixed(2)+'%</div><div class="slb2">Ort. Kayip</div></div>'
+    +'<div class="sstat"><div class="sval" style="color:var(--cyan)">'+rr+'</div><div class="slb2">Risk/Odul</div></div>'
+    +'<div class="sstat"><div class="sval" style="color:var(--gold)">'+maxStreak+'</div><div class="slb2">Max Kaz. Serisi</div></div>'
+    +'<div class="sstat"><div class="sval" style="color:var(--red)">'+maxLossStreak+'</div><div class="slb2">Max Kay. Serisi</div></div>'
+    +'<div class="sstat"><div class="sval">'+r.avgHold+'</div><div class="slb2">Ort. Bar</div></div>'
+    +'</div>';
+};
+
+//  6. HISSE ISMINE TIKLA -> TradingView 
+// renderSigs'i override ederek ticker'lara onclick ekle
+var _b5_origRenderSigsTV = renderSigs;
+renderSigs = function(){
+  _b5_origRenderSigsTV.apply(this,arguments);
+  // Sinyal listesindeki sig-ticker elementlerine onclick ekle
+  setTimeout(function(){
+    var tickers = document.querySelectorAll('.sig-ticker');
+    for(var i=0;i<tickers.length;i++){
+      (function(el){
+        if(el.dataset.tvbound) return;
+        el.dataset.tvbound='1';
+        el.style.cursor='pointer';
+        el.style.textDecoration='underline';
+        el.style.textDecorationColor='rgba(255,255,255,.3)';
+        el.addEventListener('click',function(e){
+          e.stopPropagation();
+          var ticker=el.textContent.trim();
+          openTVTicker(ticker,'D');
+        });
+      })(tickers[i]);
+    }
+    // Stlist'teki hisseler de
+    var strows = document.querySelectorAll('.strow .stt');
+    for(var j=0;j<strows.length;j++){
+      (function(el){
+        if(el.dataset.tvbound) return;
+        el.dataset.tvbound='1';
+        el.style.textDecoration='underline';
+        el.style.textDecorationColor='rgba(0,212,255,.4)';
+        el.style.cursor='pointer';
+        el.addEventListener('click',function(e){
+          e.stopPropagation();
+          openTVTicker(el.textContent.trim(),'D');
+        });
+      })(strows[j]);
+    }
+  },200);
+};
+
+// LOAD
+window.addEventListener('load',function(){
+  setTimeout(function(){
+    // Uygulama acilinca kapali pozisyonlari render et
+    renderClosedPositions();
+    // Raporu guncelle
+    renderReport();
+  },1500);
+});
+
 </script>
 </html>"""
+
+@app.get("/status")
+async def root():
+    return {"status":"ok","service":"BIST AI Proxy v3",
+            "scheduler":scheduler.running,"cache":len(_cache),
+            "tg_configured":bool(TG_TOKEN and TG_CHAT)}
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_app():
     return HTMLResponse(content=_HTML, headers={
-        "Cache-Control": "no-cache, no-store",
-        "Content-Type": "text/html; charset=utf-8"
-    })
-
-@app.get("/app", response_class=HTMLResponse)
-async def serve_app2():
-    return HTMLResponse(content=_HTML, headers={
-        "Cache-Control": "no-cache, no-store",
-        "Content-Type": "text/html; charset=utf-8"
+        "Cache-Control":"no-cache, no-store",
+        "Content-Type":"text/html; charset=utf-8"
     })
